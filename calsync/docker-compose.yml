@@ -1,0 +1,24 @@
+# Local development dependencies: PostgreSQL + Redis.
+# Usage: docker compose up -d
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: calsync
+      POSTGRES_PASSWORD: calsync
+      POSTGRES_DB: calsync
+    ports:
+      - "5432:5432"
+    volumes:
+      - calsync_pg:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - calsync_redis:/data
+
+volumes:
+  calsync_pg:
+  calsync_redis:

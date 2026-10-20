@@ -1,0 +1,230 @@
+// CalSync data model.
+//
+// The mesh is modeled as DIRECTED edges (SyncLink). An event in a source
+// calendar is mirrored into each linked target calendar, transformed by that
+// link's privacy level. EventLink maps one origin occurrence to one mirror
+// copy. Mirrors are tagged provider-side and tracked here so they are never
+// re-propagated (loop prevention).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ProviderKind {
+  google
+  microsoft
+}
+
+enum AccountStatus {
+  active
+  reauth_required
+  revoked
+}
+
+enum PrivacyLevel {
+  full // title + time + location + description (attendees ALWAYS stripped)
+  title_only // title + time only
+  busy_only // opaque "Busy" + time only
+}
+
+enum SyncLinkStatus {
+  active
+  paused
+  backfilling
+  error
+}
+
+enum EventLinkStatus {
+  live
+  deleting
+  orphaned
+}
+
+enum ChangeType {
+  created
+  updated
+  deleted
+}
+
+enum ChangeSource {
+  webhook
+  reconcile
+  backfill
+}
+
+enum ChangeState {
+  queued
+  processing
+  done
+  failed
+  skipped
+}
+
+// A tenant wraps even a solo user; simplifies future teams and billing.
+model Tenant {
+  id               String   @id @default(cuid())
+  name             String
+  plan             String   @default("free")
+  stripeCustomerId String?
+  createdAt        DateTime @default(now())
+
+  users             User[]
+  connectedAccounts ConnectedAccount[]
+  calendars         Calendar[]
+  syncLinks         SyncLink[]
+  eventLinks        EventLink[]
+  changeEvents      ChangeEvent[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  email        String   @unique
+  authSubject  String?  @unique // app-auth provider subject (Clerk/WorkOS)
+  role         String   @default("owner")
+  createdAt    DateTime @default(now())
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  connectedAccounts ConnectedAccount[]
+
+  @@index([tenantId])
+}
+
+// One connected mailbox (one Nylas grant).
+model ConnectedAccount {
+  id               String        @id @default(cuid())
+  tenantId         String
+  userId           String
+  providerKind     ProviderKind
+  aggregator       String        @default("nylas")
+  aggregatorGrantId String       @unique // Nylas grant id / Cronofy profile id
+  email            String
+  status           AccountStatus @default(active)
+  scopes           String[]
+  createdAt        DateTime      @default(now())
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  calendars Calendar[]
+
+  @@index([tenantId])
+}
+
+model Calendar {
+  id                   String   @id @default(cuid())
+  tenantId             String
+  connectedAccountId   String
+  providerCalendarId   String // id of the calendar within the provider
+  name                 String
+  timezone             String? // IANA tz of the calendar
+  isPrimary            Boolean  @default(false)
+  readOnly             Boolean  @default(false)
+  syncEnabled          Boolean  @default(true)
+  webhookSubscriptionId String?
+  webhookExpiresAt     DateTime?
+  syncCursor           String? // provider delta token for reconciliation
+  lastReconciledAt     DateTime?
+  createdAt            DateTime @default(now())
+
+  tenant           Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  connectedAccount ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  outgoingLinks SyncLink[] @relation("SourceCalendar")
+  incomingLinks SyncLink[] @relation("TargetCalendar")
+  changeEvents  ChangeEvent[]
+
+  @@unique([connectedAccountId, providerCalendarId])
+  @@index([tenantId])
+}
+
+// A directed edge: events in source mirror into target at this privacy level.
+// A bidirectional "sync A and B both ways" is TWO SyncLink rows.
+model SyncLink {
+  id               String         @id @default(cuid())
+  tenantId         String
+  sourceCalendarId String
+  targetCalendarId String
+  privacyLevel     PrivacyLevel
+  includeTransparent Boolean      @default(false) // mirror Free/transparent events?
+  status           SyncLinkStatus @default(backfilling)
+  backfilledAt     DateTime?
+  createdAt        DateTime       @default(now())
+
+  tenant         Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sourceCalendar Calendar    @relation("SourceCalendar", fields: [sourceCalendarId], references: [id], onDelete: Cascade)
+  targetCalendar Calendar    @relation("TargetCalendar", fields: [targetCalendarId], references: [id], onDelete: Cascade)
+  eventLinks     EventLink[]
+
+  @@unique([sourceCalendarId, targetCalendarId])
+  @@index([sourceCalendarId])
+  @@index([tenantId])
+}
+
+// Maps ONE origin occurrence -> ONE mirror copy under a given SyncLink.
+// The heart of the engine: update/delete iterate every EventLink of an origin.
+model EventLink {
+  id                   String          @id @default(cuid())
+  tenantId             String
+  syncLinkId           String
+  originCalendarId     String
+  originProviderEventId String
+  originMasterId       String? // recurrence master id (for series)
+  // Specific overridden instance; EMPTY STRING for a master/single event.
+  // Non-nullable so it participates cleanly in the compound unique below
+  // (Prisma compound uniques don't handle NULL well).
+  originRecurrenceId   String  @default("")
+  mirrorCalendarId     String
+  mirrorProviderEventId String
+  appliedPrivacyLevel  PrivacyLevel // snapshot; a level change triggers a rebuild
+  contentHash          String // hash of the transformed payload we last wrote
+  originSeq            String? // provider version/updated-at we last synced from
+  status               EventLinkStatus @default(live)
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  syncLink SyncLink @relation(fields: [syncLinkId], references: [id], onDelete: Cascade)
+
+  @@unique([syncLinkId, originProviderEventId, originRecurrenceId])
+  @@index([mirrorProviderEventId]) // "is this incoming change a mirror we made?"
+  @@index([originCalendarId, originProviderEventId])
+  @@index([tenantId])
+}
+
+// Raw inbound webhook; unique dedupKey drops provider replays.
+model WebhookDelivery {
+  id             String   @id @default(cuid())
+  aggregator     String   @default("nylas")
+  rawPayload     Json
+  signatureValid Boolean
+  dedupKey       String   @unique
+  receivedAt     DateTime @default(now())
+  processedAt    DateTime?
+}
+
+// Normalized unit of work / idempotency ledger. The worker claims and runs these.
+model ChangeEvent {
+  id              String       @id @default(cuid())
+  tenantId        String
+  calendarId      String
+  providerEventId String
+  changeType      ChangeType
+  providerSeq     String? // provider version; dedups reprocessing the same version
+  source          ChangeSource @default(webhook)
+  state           ChangeState  @default(queued)
+  attempts        Int          @default(0)
+  error           String?
+  createdAt       DateTime     @default(now())
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  calendar Calendar @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+
+  @@unique([calendarId, providerEventId, providerSeq])
+  @@index([tenantId])
+  @@index([state])
+}
